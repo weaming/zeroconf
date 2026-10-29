@@ -185,11 +185,20 @@ func newClient(opts clientOpts) (*client, error) {
 func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 	// start listening for responses
 	msgCh := make(chan *dns.Msg, 32)
+	var recvWg sync.WaitGroup
 	if c.ipv4conn != nil {
-		go c.recv(ctx, c.ipv4conn, msgCh)
+		recvWg.Add(1)
+		go func() {
+			defer recvWg.Done()
+			c.recv(ctx, c.ipv4conn, msgCh)
+		}()
 	}
 	if c.ipv6conn != nil {
-		go c.recv(ctx, c.ipv6conn, msgCh)
+		recvWg.Add(1)
+		go func() {
+			defer recvWg.Done()
+			c.recv(ctx, c.ipv6conn, msgCh)
+		}()
 	}
 
 	// Iterate through channels from listeners goroutines
@@ -201,6 +210,10 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 			// Context expired. Notify subscriber that we are done here.
 			params.done()
 			c.shutdown()
+			// Closing the connections unblocks recv; wait for it to return so a
+			// resolver that is created and dropped repeatedly does not leave a
+			// goroutine and its socket behind on every cycle.
+			recvWg.Wait()
 			return
 		case msg := <-msgCh:
 			entries = make(map[string]*ServiceEntry)

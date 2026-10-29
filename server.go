@@ -155,6 +155,12 @@ type Server struct {
 
 	ipv4mu sync.Mutex // see writeTo4
 	ipv6mu sync.Mutex // see writeTo6
+
+	// textMu guards service.Text. SetText replaces the slice from the caller's
+	// goroutine while the receive path reads it, and a slice header is not
+	// written atomically: a responder could otherwise pair the new data pointer
+	// with the old length.
+	textMu sync.RWMutex
 }
 
 // Constructs server structure
@@ -200,8 +206,19 @@ func (s *Server) Shutdown() {
 
 // SetText updates and announces the TXT records
 func (s *Server) SetText(text []string) {
+	s.textMu.Lock()
 	s.service.Text = text
+	s.textMu.Unlock()
 	s.announceText()
+}
+
+// textSnapshot returns the current TXT strings. SetText replaces the slice
+// rather than mutating it, so the returned value stays consistent for the
+// caller; callers must not modify it.
+func (s *Server) textSnapshot() []string {
+	s.textMu.RLock()
+	defer s.textMu.RUnlock()
+	return s.service.Text
 }
 
 // TTL sets the TTL for DNS replies
@@ -289,6 +306,18 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 
 // parsePacket is used to parse an incoming packet
 func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
+	// mDNS listens on a shared port, so anyone on the link can hand the parser a
+	// header claiming thousands of records. Reject implausible counts before the
+	// section walk instead of letting it allocate and chase a bogus length.
+	const maxRecords = 256
+	if len(packet) >= 12 {
+		for offset := 4; offset <= 10; offset += 2 {
+			if count := int(packet[offset])<<8 | int(packet[offset+1]); count > maxRecords {
+				return fmt.Errorf("malformed DNS packet: section count %d exceeds %d", count, maxRecords)
+			}
+		}
+	}
+
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
 		// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
@@ -423,7 +452,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
-		Txt: s.service.Text,
+		Txt: s.textSnapshot(),
 	}
 	srv := &dns.SRV{
 		Hdr: dns.RR_Header{
@@ -476,7 +505,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 			Class:  dns.ClassINET | qClassCacheFlush,
 			Ttl:    ttl,
 		},
-		Txt: s.service.Text,
+		Txt: s.textSnapshot(),
 	}
 	dnssd := &dns.PTR{
 		Hdr: dns.RR_Header{
@@ -552,7 +581,7 @@ func (s *Server) probe() {
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
-		Txt: s.service.Text,
+		Txt: s.textSnapshot(),
 	}
 	q.Ns = []dns.RR{srv, txt}
 
@@ -590,8 +619,34 @@ func (s *Server) probe() {
 	}
 }
 
-// announceText sends a Text announcement with cache flush enabled
+// announceText multicasts the TXT record without waiting for a query. RFC 6762
+// 8.4 asks for at least two unsolicited responses one second apart: mDNS is
+// unacknowledged multicast, so a single dropped packet would otherwise cost a
+// subscriber the whole update.
 func (s *Server) announceText() {
+	go func() {
+		for i := 0; i < multicastRepetitions; i++ {
+			if i > 0 {
+				time.Sleep(time.Second)
+			}
+			// Shutdown sends the goodbye records before it closes the
+			// connections; an updater landing in that window would re-announce
+			// a service that was just withdrawn.
+			s.shutdownLock.Lock()
+			down := s.isShutdown
+			s.shutdownLock.Unlock()
+			if down {
+				return
+			}
+			if err := s.announceTextOnce(); err != nil {
+				log.Printf("[ERR] zeroconf: failed to announce text: %v", err)
+			}
+		}
+	}()
+}
+
+// announceTextOnce sends one TXT announcement with cache flush enabled.
+func (s *Server) announceTextOnce() error {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
 
@@ -602,11 +657,11 @@ func (s *Server) announceText() {
 			Class:  dns.ClassINET | qClassCacheFlush,
 			Ttl:    s.ttl,
 		},
-		Txt: s.service.Text,
+		Txt: s.textSnapshot(),
 	}
 
 	resp.Answer = []dns.RR{txt}
-	s.multicastResponse(resp, 0)
+	return s.multicastResponse(resp, 0)
 }
 
 func (s *Server) unregister() error {
@@ -621,12 +676,21 @@ func (s *Server) unregister() error {
 func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
 	v4 := s.service.AddrIPv4
 	v6 := s.service.AddrIPv6
-	if len(v4) == 0 && len(v6) == 0 {
-		iface, _ := net.InterfaceByIndex(ifIndex)
-		if iface != nil {
+	if iface, err := net.InterfaceByIndex(ifIndex); err == nil {
+		if len(v4) == 0 && len(v6) == 0 {
 			a4, a6 := addrsForInterface(iface)
 			v4 = append(v4, a4...)
 			v6 = append(v6, a6...)
+		} else if subnets := ifaceSubnets(iface); len(subnets) > 0 {
+			// A host with bridges, VPNs or several NICs owns many addresses.
+			// Answering with all of them hands a peer on one link addresses it
+			// cannot reach, so keep only those this link carries.
+			if kept := reachableFrom(v4, subnets); len(kept) > 0 {
+				v4 = kept
+			}
+			if kept := reachableFrom(v6, subnets); len(kept) > 0 {
+				v6 = kept
+			}
 		}
 	}
 	if ttl > 0 {
@@ -664,6 +728,35 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 		list = append(list, aaaa)
 	}
 	return list
+}
+
+// ifaceSubnets lists the interface's own addresses as networks.
+func ifaceSubnets(iface *net.Interface) []*net.IPNet {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	subnets := make([]*net.IPNet, 0, len(addrs))
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok {
+			subnets = append(subnets, ipNet)
+		}
+	}
+	return subnets
+}
+
+// reachableFrom keeps the addresses one of the given networks contains.
+func reachableFrom(addrs []net.IP, subnets []*net.IPNet) []net.IP {
+	kept := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		for _, subnet := range subnets {
+			if subnet.Contains(addr) {
+				kept = append(kept, addr)
+				break
+			}
+		}
+	}
+	return kept
 }
 
 func addrsForInterface(iface *net.Interface) ([]net.IP, []net.IP) {
