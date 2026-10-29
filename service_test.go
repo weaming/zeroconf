@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -179,6 +180,12 @@ func TestLoopback(t *testing.T) {
 }
 
 func testLoopback(t *testing.T, ip IPType) {
+	// The Linux loopback interface carries no MULTICAST flag, so joining the
+	// mDNS group on it fails and there is nothing to discover there.
+	if runtime.GOOS == "linux" {
+		t.Skip("no multicast on the Linux loopback interface")
+	}
+
 	var lo []net.Interface
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -196,7 +203,14 @@ func testLoopback(t *testing.T, ip IPType) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	server, err := Register(mdnsName, mdnsService, mdnsDomain, mdnsPort, []string{"txtv=0"}, lo)
+	// Name the address explicitly: Register derives addresses from the
+	// interface and skips loopback ones, which leaves nothing on systems whose
+	// loopback carries no link-local address.
+	ips := []string{"127.0.0.1"}
+	if ip == IPv6 {
+		ips = []string{"::1"}
+	}
+	server, err := RegisterProxy(mdnsName, mdnsService, mdnsDomain, mdnsPort, mdnsName, ips, []string{"txtv=0"}, lo)
 	if err != nil {
 		t.Fatalf("error while registering mdns service: %s", err)
 	}
