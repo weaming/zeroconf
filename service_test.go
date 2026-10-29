@@ -84,8 +84,11 @@ func TestNoRegister(t *testing.T) {
 		}
 	}(entries)
 
+	// A type nobody registers keeps this independent of the entries an earlier
+	// test leaves behind in the multicast cache.
+	unusedService := "_test--unused._tcp"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := resolver.Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+	if err := resolver.Browse(ctx, unusedService, "local.", entries); err != nil {
 		t.Fatalf("Expected browse success, but got %v", err)
 	}
 	<-ctx.Done()
@@ -200,7 +203,11 @@ func testLoopback(t *testing.T, ip IPType) {
 	t.Cleanup(server.Shutdown)
 
 	entries := make(chan *ServiceEntry, 100)
-	if err := Browse(ctx, mdnsService, mdnsDomain, entries, SelectIfaces(lo), SelectIPTraffic(ip)); err != nil {
+	resolver, err := NewResolver(SelectIfaces(lo), SelectIPTraffic(ip))
+	if err != nil {
+		t.Fatalf("Expected resolver success, but got %v", err)
+	}
+	if err := resolver.Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
 		t.Fatalf("Expected browse success, but got %v", err)
 	}
 	<-ctx.Done()
