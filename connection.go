@@ -64,6 +64,27 @@ func writeTo4(c *ipv4.PacketConn, mu *sync.Mutex, buf []byte, ifIndex int) {
 	_, _ = c.WriteTo(buf, nil, ipv4Addr)
 }
 
+// writeTo6 is writeTo4 for the IPv6 group: the same platforms refuse a control
+// message naming an interface without a route to it, so the interface is set on
+// the socket instead and the write carries no control message.
+func writeTo6(c *ipv6.PacketConn, mu *sync.Mutex, buf []byte, ifIndex int) {
+	if runtime.GOOS == "linux" {
+		_, _ = c.WriteTo(buf, &ipv6.ControlMessage{IfIndex: ifIndex}, ipv6Addr)
+		return
+	}
+	iface, err := net.InterfaceByIndex(ifIndex)
+	if err != nil {
+		log.Printf("[WARN] mdns: Failed to find interface %d: %v", ifIndex, err)
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if err := c.SetMulticastInterface(iface); err != nil {
+		log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+	}
+	_, _ = c.WriteTo(buf, nil, ipv6Addr)
+}
+
 func joinUdp6Multicast(interfaces []net.Interface) (*ipv6.PacketConn, error) {
 	udpConn, err := net.ListenUDP("udp6", mdnsWildcardAddrIPv6)
 	if err != nil {

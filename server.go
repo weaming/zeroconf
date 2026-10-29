@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -155,6 +154,7 @@ type Server struct {
 	ttl            uint32
 
 	ipv4mu sync.Mutex // see writeTo4
+	ipv6mu sync.Mutex // see writeTo6
 }
 
 // Constructs server structure
@@ -734,32 +734,11 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 	}
 
 	if s.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
 		if ifIndex != 0 {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+			writeTo6(s.ipv6conn, &s.ipv6mu, buf, ifIndex)
 		} else {
 			for _, intf := range s.ifaces {
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-					}
-				}
-				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+				writeTo6(s.ipv6conn, &s.ipv6mu, buf, intf.Index)
 			}
 		}
 	}

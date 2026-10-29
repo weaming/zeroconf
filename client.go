@@ -3,9 +3,7 @@ package zeroconf
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -148,6 +146,7 @@ type client struct {
 	ifaces   []net.Interface
 
 	ipv4mu sync.Mutex // serialises the socket interface switch in writeTo4
+	ipv6mu sync.Mutex // serialises the socket interface switch in writeTo6
 }
 
 // Client structure constructor
@@ -453,20 +452,8 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 		}
 	}
 	if c.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
 		for ifi := range c.ifaces {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = c.ifaces[ifi].Index
-			default:
-				if err := c.ipv6conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			c.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+			writeTo6(c.ipv6conn, &c.ipv6mu, buf, c.ifaces[ifi].Index)
 		}
 	}
 	return nil
